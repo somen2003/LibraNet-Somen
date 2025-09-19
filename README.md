@@ -48,3 +48,20 @@ This project demonstrates **OOP design in C++**, exception handling, in-memory r
 ### Build
 ```bash
 g++ -std=c++17 LibraNet_extended.cpp -o LibraNet.exe -Wall -Wextra
+
+
+--- LibraNet Menu ---
+1. Borrow Item
+2. Return Item
+3. Archive Magazine
+4. Search by Type
+5. Add Item
+6. Add User
+7. Renew Borrow
+8. Reserve Item
+9. Cancel Reservation
+10. List Overdue
+11. View User Borrows
+12. View User Fines
+0. Exit
+
