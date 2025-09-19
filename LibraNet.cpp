@@ -1,5 +1,5 @@
-// LibraNet.cpp
-// Compile: g++ -std=c++17 LibraNet.cpp -o LibraNet.exe -Wall -Wextra
+// LibraNet_extended.cpp
+// Compile: g++ -std=c++17 LibraNet_extended.cpp -o LibraNet.exe -Wall -Wextra
 
 #include <iostream>
 #include <string>
@@ -112,7 +112,6 @@ public:
             BorrowDuration bd; bd.explicitRange_ = true; bd.end_ = p2; return bd;
         }
 
-        
         std::regex isoRx(R"(^(P(?:(\d+)D)|PT?(?:(\d+)H))$)", std::regex::icase);
         if (std::regex_search(s, m, isoRx)) {
             if (m[1].matched) {
@@ -125,7 +124,6 @@ public:
             }
         }
 
-        
         std::regex nlRx(R"(^\s*(\d+)\s*(days?|d|weeks?|w|hours?|h)\s*$)", std::regex::icase);
         if (std::regex_search(s, m, nlRx)) {
             int num = std::stoi(m[1].str());
@@ -170,8 +168,10 @@ public:
     Fine(int id, int itemId, int userId, Money amount, string reason)
       : id_(id), itemId_(itemId), userId_(userId), amount_(amount), reason_(move(reason)), appliedAt_(system_clock::now()) {}
     int id() const { return id_; }
+    int userId() const { return userId_; }
     Money amount() const { return amount_; }
     string reason() const { return reason_; }
+    system_clock::time_point appliedAt() const { return appliedAt_; }
 };
 
 /* Playable interface */
@@ -285,6 +285,7 @@ public:
     system_clock::time_point dueAt() const { return dueAt_; }
     BorrowStatus status() const { return status_; }
     void markReturned() { status_ = BorrowStatus::RETURNED; }
+    void setDueAt(system_clock::time_point d) { dueAt_ = d; }
     bool isOverdue() const { return system_clock::now() > dueAt_; }
     int overdueDays() const {
         if (!isOverdue()) return 0;
@@ -373,6 +374,20 @@ public:
         for (auto &p: storage_) if (p.second->userId() == userId) res.push_back(p.second);
         return res;
     }
+
+    vector<shared_ptr<BorrowRecord>> findActiveByUserId(int userId) const {
+        vector<shared_ptr<BorrowRecord>> res;
+        std::lock_guard<std::mutex> l(mtx_);
+        for (auto &p: storage_) if (p.second->userId() == userId && p.second->status() == BorrowStatus::ACTIVE) res.push_back(p.second);
+        return res;
+    }
+
+    vector<shared_ptr<BorrowRecord>> all() const {
+        vector<shared_ptr<BorrowRecord>> res;
+        std::lock_guard<std::mutex> l(mtx_);
+        for (auto &p: storage_) res.push_back(p.second);
+        return res;
+    }
 };
 
 class FineRepo {
@@ -387,13 +402,23 @@ public:
         storage_[id] = f;
         return f;
     }
-    vector<shared_ptr<Fine>> findByUserId(int /*userId*/) const {
+    vector<shared_ptr<Fine>> findByUserId(int userId) const {
         vector<shared_ptr<Fine>> res;
         std::lock_guard<std::mutex> l(mtx_);
-        for (auto &p: storage_) res.push_back(p.second);
+        for (auto &p: storage_) if (p.second->userId() == userId) res.push_back(p.second);
         return res;
     }
 };
+
+
+// Helper: format time_point to human-readable string
+static string formatTime(const system_clock::time_point &tp) {
+    std::time_t t = system_clock::to_time_t(tp);
+    std::tm tm = *std::localtime(&t);
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
 
 
 class LibraryService {
@@ -402,6 +427,8 @@ class LibraryService {
     BorrowRecordRepo& records_;
     FineRepo& fines_;
     Money dailyFineRate_;
+    // simple reservation map: itemId -> userId
+    unordered_map<int,int> reservations_;
 public:
     LibraryService(ItemRepo& items, UserRepo& users, BorrowRecordRepo& records, FineRepo& fines, Money dailyFineRate)
       : items_(items), users_(users), records_(records), fines_(fines), dailyFineRate_(dailyFineRate) {}
@@ -412,7 +439,16 @@ public:
         auto itemOpt = items_.findById(itemId);
         if (!itemOpt) throw NotFoundException("Item not found");
         auto item = *itemOpt;
-        if (item->status() != AvailabilityStatus::AVAILABLE) throw ItemNotAvailableException("Item not available for borrowing");
+
+        // allow borrow if AVAILABLE or RESERVED by same user
+        if (item->status() == AvailabilityStatus::BORROWED || item->status() == AvailabilityStatus::MAINTENANCE) 
+            throw ItemNotAvailableException("Item not available for borrowing");
+        if (item->status() == AvailabilityStatus::RESERVED) {
+            auto it = reservations_.find(itemId);
+            if (it == reservations_.end() || it->second != userId) throw ItemNotAvailableException("Item reserved by another user");
+            // otherwise allow borrowing and remove reservation
+            reservations_.erase(itemId);
+        }
 
         BorrowDuration bd = BorrowDuration::parse(durationStr);
         system_clock::time_point now = system_clock::now();
@@ -422,7 +458,7 @@ public:
         item->setStatus(AvailabilityStatus::BORROWED);
         auto rec = make_shared<BorrowRecord>(0, itemId, userId, now, due);
         records_.add(rec);
-        cout << "Borrowed item " << itemId << " by user " << userId << ". Due at epoch:" << duration_cast<seconds>(due.time_since_epoch()).count() << "\n";
+        cout << "Borrowed item " << itemId << " by user " << userId << ". Due at " << formatTime(due) << "\n";
     }
 
     void returnItem(int userId, int itemId) {
@@ -450,6 +486,63 @@ public:
         item->setStatus(AvailabilityStatus::AVAILABLE);
     }
 
+    // renew borrow: only allowed if record exists, same user, not overdue
+    void renewBorrow(int userId, int itemId, const string& extraDurationStr) {
+        auto recOpt = records_.findActiveByItemId(itemId);
+        if (!recOpt) throw BorrowException("No active borrow record to renew");
+        auto rec = *recOpt;
+        if (rec->userId() != userId) throw BorrowException("Only borrowing user can renew");
+        if (rec->isOverdue()) throw BorrowException("Cannot renew overdue borrow");
+
+        BorrowDuration extra = BorrowDuration::parse(extraDurationStr);
+        system_clock::time_point newDue = extra.computeDueAt(rec->dueAt());
+        if (newDue <= rec->dueAt()) throw InvalidInputException("New due must be after current due date");
+        rec->setDueAt(newDue);
+        cout << "Renewed borrow for item " << itemId << ". New due: " << formatTime(newDue) << "\n";
+    }
+
+    // reserve item for user
+    void reserveItem(int userId, int itemId) {
+        auto userOpt = users_.findById(userId);
+        if (!userOpt) throw NotFoundException("User not found");
+        auto itemOpt = items_.findById(itemId);
+        if (!itemOpt) throw NotFoundException("Item not found");
+        auto item = *itemOpt;
+        if (item->status() != AvailabilityStatus::AVAILABLE) throw BorrowException("Only available items can be reserved");
+        item->setStatus(AvailabilityStatus::RESERVED);
+        reservations_[itemId] = userId;
+        cout << "Reserved item " << itemId << " for user " << userId << "\n";
+    }
+
+    void cancelReservation(int userId, int itemId) {
+        auto it = reservations_.find(itemId);
+        if (it == reservations_.end()) throw BorrowException("No reservation found for item");
+        if (it->second != userId) throw BorrowException("Only reserving user can cancel reservation");
+        reservations_.erase(itemId);
+        auto itemOpt = items_.findById(itemId);
+        if (itemOpt) (*itemOpt)->setStatus(AvailabilityStatus::AVAILABLE);
+        cout << "Cancelled reservation for item " << itemId << " by user " << userId << "\n";
+    }
+
+    // list overdue borrow records
+    vector<shared_ptr<BorrowRecord>> listOverdueRecords() const {
+        vector<shared_ptr<BorrowRecord>> res;
+        for (auto &r : records_.all()) {
+            if (r->status() == BorrowStatus::ACTIVE && r->isOverdue()) res.push_back(r);
+        }
+        return res;
+    }
+
+    // get active borrows for a user
+    vector<shared_ptr<BorrowRecord>> getActiveBorrowsForUser(int userId) const {
+        return records_.findActiveByUserId(userId);
+    }
+
+    // get fines for a user
+    vector<shared_ptr<Fine>> getFinesForUser(int userId) const {
+        return fines_.findByUserId(userId);
+    }
+
     vector<shared_ptr<Item>> searchByType(const string& typeName) {
         return items_.findByType(typeName);
     }
@@ -472,7 +565,6 @@ int main() {
     BorrowRecordRepo recordRepo;
     FineRepo fineRepo;
 
-    
     auto book1 = make_shared<Book>(101, "Design Patterns", vector<string>{"Gamma","Helm","Johnson","Vlissides"}, 395);
     auto audio1 = make_shared<Audiobook>(102, "Clean Code (Audio)", vector<string>{"Robert C. Martin"}, hours(9), "Narrator A");
     auto mag1 = make_shared<EMagazine>(103, "Tech Monthly", vector<string>{"Editorial Team"}, 15, system_clock::now());
@@ -486,7 +578,6 @@ int main() {
 
     LibraryService lib(itemRepo, userRepo, recordRepo, fineRepo, Money::fromINR(10.0));
 
-  
     while (true) {
         cout << "\n--- LibraNet Menu ---\n";
         cout << "1. Borrow Item\n";
@@ -495,6 +586,12 @@ int main() {
         cout << "4. Search by Type\n";
         cout << "5. Add Item\n";
         cout << "6. Add User\n";
+        cout << "7. Renew Borrow\n";
+        cout << "8. Reserve Item\n";
+        cout << "9. Cancel Reservation\n";
+        cout << "10. List Overdue\n";
+        cout << "11. View User Borrows\n";
+        cout << "12. View User Fines\n";
         cout << "0. Exit\n";
         cout << "Choice: ";
 
@@ -575,6 +672,41 @@ int main() {
                 auto user = make_shared<User>(userId, name, limit);
                 userRepo.save(user, user->id());
                 cout << "User added: " << name << " (id=" << userId << ")\n";
+
+            } else if (choice == 7) {
+                int userId, itemId; string extra;
+                cout << "Enter userId itemId extraDuration (e.g., 201 101 3 days): ";
+                std::cin >> userId >> itemId;
+                std::getline(std::cin, extra);
+                if (extra.empty()) std::getline(std::cin, extra);
+                lib.renewBorrow(userId, itemId, extra);
+
+            } else if (choice == 8) {
+                int userId, itemId;
+                cout << "Enter userId itemId to reserve: "; std::cin >> userId >> itemId;
+                lib.reserveItem(userId, itemId);
+
+            } else if (choice == 9) {
+                int userId, itemId;
+                cout << "Enter userId itemId to cancel reservation: "; std::cin >> userId >> itemId;
+                lib.cancelReservation(userId, itemId);
+
+            } else if (choice == 10) {
+                auto overdue = lib.listOverdueRecords();
+                if (overdue.empty()) cout << "No overdue records\n";
+                for (auto &r: overdue) cout << "Overdue: rec=" << r->id() << " item=" << r->itemId() << " user=" << r->userId() << " due=" << formatTime(r->dueAt()) << "\n";
+
+            } else if (choice == 11) {
+                int userId; cout << "Enter userId: "; std::cin >> userId;
+                auto borrows = lib.getActiveBorrowsForUser(userId);
+                if (borrows.empty()) cout << "No active borrows for user " << userId << "\n";
+                for (auto &r: borrows) cout << "Borrow rec=" << r->id() << " item=" << r->itemId() << " due=" << formatTime(r->dueAt()) << "\n";
+
+            } else if (choice == 12) {
+                int userId; cout << "Enter userId: "; std::cin >> userId;
+                auto fines = lib.getFinesForUser(userId);
+                if (fines.empty()) cout << "No fines for user " << userId << "\n";
+                for (auto &f: fines) cout << "Fine id=" << f->id() << " amount=" << f->amount().str() << " reason=" << f->reason() << "\n";
             }
 
         } catch (const std::exception& e) {
