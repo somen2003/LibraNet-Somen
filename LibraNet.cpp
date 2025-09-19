@@ -36,9 +36,7 @@ using std::chrono::minutes;
 using std::chrono::seconds;
 using std::chrono::duration_cast;
 
-/* =========================
-   Utility: Money (paise)
-   ========================= */
+
 class Money {
     int64_t paise_;
 public:
@@ -61,9 +59,7 @@ public:
     }
 };
 
-/* =========================
-   Exceptions / Error Model
-   ========================= */
+
 struct LibraryException : public std::runtime_error {
     explicit LibraryException(const string& msg) : std::runtime_error(msg) {}
 };
@@ -74,9 +70,7 @@ struct ReturnException : public LibraryException { using LibraryException::Libra
 struct ArchiveException : public LibraryException { using LibraryException::LibraryException; };
 struct ItemNotAvailableException : public BorrowException { using BorrowException::BorrowException; };
 
-/* =========================
-   Enums & Small Types
-   ========================= */
+
 enum class AvailabilityStatus { AVAILABLE, BORROWED, RESERVED, MAINTENANCE };
 enum class BorrowStatus { ACTIVE, RETURNED, OVERDUE };
 
@@ -118,7 +112,7 @@ public:
             BorrowDuration bd; bd.explicitRange_ = true; bd.end_ = p2; return bd;
         }
 
-        // ISO 8601 simple: PnD or PTnH
+        
         std::regex isoRx(R"(^(P(?:(\d+)D)|PT?(?:(\d+)H))$)", std::regex::icase);
         if (std::regex_search(s, m, isoRx)) {
             if (m[1].matched) {
@@ -131,7 +125,7 @@ public:
             }
         }
 
-        // Natural language: "10 days", "2 weeks", "48h"
+        
         std::regex nlRx(R"(^\s*(\d+)\s*(days?|d|weeks?|w|hours?|h)\s*$)", std::regex::icase);
         if (std::regex_search(s, m, nlRx)) {
             int num = std::stoi(m[1].str());
@@ -335,7 +329,7 @@ public:
     }
 };
 
-/* Specialized Repos */
+
 class ItemRepo : public InMemoryRepo<Item> {
 public:
     vector<shared_ptr<Item>> findByType(const string& typeName) const {
@@ -401,9 +395,7 @@ public:
     }
 };
 
-/* =========================
-   LibraryService (business logic)
-   ========================= */
+
 class LibraryService {
     ItemRepo& items_;
     UserRepo& users_;
@@ -480,7 +472,7 @@ int main() {
     BorrowRecordRepo recordRepo;
     FineRepo fineRepo;
 
-    // Seed sample data
+    
     auto book1 = make_shared<Book>(101, "Design Patterns", vector<string>{"Gamma","Helm","Johnson","Vlissides"}, 395);
     auto audio1 = make_shared<Audiobook>(102, "Clean Code (Audio)", vector<string>{"Robert C. Martin"}, hours(9), "Narrator A");
     auto mag1 = make_shared<EMagazine>(103, "Tech Monthly", vector<string>{"Editorial Team"}, 15, system_clock::now());
@@ -494,7 +486,7 @@ int main() {
 
     LibraryService lib(itemRepo, userRepo, recordRepo, fineRepo, Money::fromINR(10.0));
 
-    // Interactive menu
+  
     while (true) {
         cout << "\n--- LibraNet Menu ---\n";
         cout << "1. Borrow Item\n";
